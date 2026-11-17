@@ -31,6 +31,7 @@ DEPS = {
     "dep_c": "pub struct Thing;",
     "dep_b": "pub use dep_c::Thing;\npub fn make() -> Thing { Thing }",
     "dep_marker": "pub trait Marker {}\npub use dep_derive::Marker;",
+    "dep_keep": "pub use dep_c::Thing;",
 }
 
 DERIVE = """
@@ -71,16 +72,49 @@ fn private() -> dep_private::P {
     dep_private::P
 }
 
+// transitive
 #[cfg(feature = "transitive")]
 pub fn transitive() -> dep_b::Thing {
     dep_b::make()
 }
+// end transitive
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn helper() {
         dep_dev::helper();
+    }
+}
+"""
+
+
+SAME_NAMED_IMPLS = """
+#[cfg(feature = "transitive")]
+pub mod first {
+    pub struct S;
+    impl S {
+        pub fn get(&self) -> dep_b::Thing {
+            dep_b::make()
+        }
+    }
+}
+
+pub mod second {
+    pub struct S;
+    impl S {
+        pub fn get(&self) -> dep_c::Thing {
+            dep_c::Thing
+        }
+    }
+}
+
+pub mod third {
+    pub struct S;
+    impl S {
+        pub fn get(&self) -> dep_keep::Thing {
+            dep_keep::Thing
+        }
     }
 }
 """
@@ -105,8 +139,17 @@ class Fixture:
     """A git repository with a published crate `subject` and path dependencies under `deps/`."""
 
     def __init__(
-        self, workspace: bool = False, private_dep_c: bool = False, cargo_env: bool = False
+        self,
+        workspace: bool = False,
+        private_dep_c: str | None = None,
+        public_dep_c: bool = False,
+        keep_dep_c_1: bool = False,
+        same_named_impls: bool = False,
+        cargo_env: bool = False,
     ):
+        self.same_named_impls = same_named_impls
+        self.public_dep_c = public_dep_c
+        self.keep_dep_c_1 = keep_dep_c_1
         self.workspace = workspace
         self.private_dep_c = private_dep_c
         self.cargo_env = cargo_env
@@ -136,6 +179,8 @@ class Fixture:
             if name == "dep_b":
                 dep_c = "../dep_c2" if self.dep_b_uses_dep_c_2 else "../dep_c"
                 deps = f'[dependencies]\ndep_c = {{ path = "{dep_c}" }}\n'
+            if name == "dep_keep":
+                deps = '[dependencies]\ndep_c = { path = "../dep_c" }\n'
             if name == "dep_marker":
                 deps = '[dependencies]\ndep_derive = { path = "../dep_derive" }\n'
             self.write(
@@ -156,11 +201,22 @@ class Fixture:
         )
         self.write("deps/dep_c2/src/lib.rs", DEPS["dep_c"])
         source = SUBJECT
+        if self.same_named_impls:
+            source = re.sub(r"// transitive.*// end transitive\n", "", source, flags=re.DOTALL)
+            source += SAME_NAMED_IMPLS
         extra = ""
         if self.private_dep_c:
-            source += "\n#[allow(dead_code)]\nfn private_c() -> dep_c::Thing {\n    dep_c::Thing\n}\n"
+            visibility = "pub " if self.public_dep_c else ""
+            source += f"\n#[allow(dead_code)]\n{visibility}fn direct_c() -> dep_c::Thing {{\n    dep_c::Thing\n}}\n"
             path = "../deps" if self.workspace else "deps"
-            extra += f'dep_c = {{ path = "{path}/dep_c", version = "1.0.0" }}\n'
+            directory = "dep_c2" if self.private_dep_c == "2.0.0" else "dep_c"
+            extra += (
+                f'dep_c = {{ path = "{path}/{directory}", version = "{self.private_dep_c}" }}\n'
+            )
+        if self.keep_dep_c_1:
+            source += "\npub fn kept() -> dep_keep::Thing {\n    dep_keep::Thing\n}\n"
+            path = "../deps" if self.workspace else "deps"
+            extra += f'dep_keep = {{ path = "{path}/dep_keep", version = "1.0.0" }}\n'
         if self.cargo_env:
             source += '\npub const VALUE: &str = env!("PUBLIC_DEPS_FIXTURE");\n'
             self.write(".cargo/config.toml", '[env]\nPUBLIC_DEPS_FIXTURE = "set"\n')
@@ -216,6 +272,65 @@ class CompatibilityTest(unittest.TestCase):
         for requirement in ["~1.2", "=1.2.3", ">=1, <3", "*"]:
             with self.assertRaises(check.Undecided):
                 check.compatibility_key(requirement)
+
+
+class ChangedItemsTest(unittest.TestCase):
+    def test_matches_references_by_site_and_position(self):
+        old = {
+            ("s::f", "/function/sig/output", "a::T", "struct"): {("a", "1.2.0")},
+            ("s::g", "/function/sig/output", "b::U", "trait"): {("b", "0.3.1")},
+            ("s::h", "/function/sig/output", "c::V", "struct"): {("c", "1.0.0")},
+        }
+        new = {
+            ("s::f", "/function/sig/output", "a::T", "struct"): {("a", "2.0.0")},
+            ("s::g", "/function/sig/output", "b::U", "trait"): {("b", "0.3.9")},
+            ("s::k", "/function/sig/output", "c::V", "struct"): {("c", "2.0.0")},
+        }
+        self.assertEqual(
+            check.changed_items(old, new), [("a::T` in `s::f", "a", {"1.2.0"}, {"2.0.0"})]
+        )
+
+    def test_other_sites_do_not_hide_a_change(self):
+        old = {
+            ("s::transitive", "/output", "c::Thing", "struct"): {("c", "1.0.0")},
+            ("s::direct", "/output", "c::Thing", "struct"): {("c", "2.0.0")},
+        }
+        new = {
+            ("s::transitive", "/output", "c::Thing", "struct"): {("c", "2.0.0")},
+            ("s::direct", "/output", "c::Thing", "struct"): {("c", "2.0.0")},
+        }
+        self.assertEqual(len(check.changed_items(old, new)), 1)
+
+    def test_zero_minor_versions_are_incompatible(self):
+        old = {("s::f", "/output", "n::Client", "struct"): {("n", "0.50.0")}}
+        new = {("s::f", "/output", "n::Client", "struct"): {("n", "0.51.0")}}
+        self.assertEqual(len(check.changed_items(old, new)), 1)
+
+
+class SiteTest(unittest.TestCase):
+    def test_colliding_site_names_are_undecided(self):
+        doc = self.doc(9, 10)
+        with self.assertRaises(check.Undecided):
+            check.foreign_reference_sites(doc)
+
+    def test_colliding_site_names_with_the_same_crate_are_merged(self):
+        references = check.foreign_reference_sites(self.doc(9, 9))
+        self.assertEqual(list(references), [1])
+
+    def doc(self, first: int, second: int) -> dict:
+        def function(id: int) -> dict:
+            return {"function": {"sig": {"output": {"resolved_path": {"path": "T", "id": id}}}}}
+
+        return {
+            "paths": {
+                "9": {"crate_id": 1, "path": ["c", "T"], "kind": "struct"},
+                "10": {"crate_id": 2, "path": ["c", "T"], "kind": "struct"},
+            },
+            "index": {
+                "1": {"crate_id": 0, "name": "get", "inner": function(first)},
+                "2": {"crate_id": 0, "name": "get", "inner": function(second)},
+            },
+        }
 
 
 class MarkerTest(unittest.TestCase):
@@ -278,13 +393,71 @@ class AnalyzeTest(unittest.TestCase):
         head = fixture.bump("dep_sig", "2.0.0", "build(deps)!: bump dep_sig")
         self.assertEqual(fixture.analyze(base, head).finding, check.FINDING_NONE)
 
-    def test_derive_and_optional_transitive_bumps(self):
-        for name in ["dep_marker", "dep_b"]:
-            fixture = Fixture()
+    def test_derive_bump(self):
+        fixture = Fixture()
+        base = fixture.git("rev-parse", "HEAD")
+        head = fixture.bump("dep_marker", "2.0.0", "build(deps): bump dep_marker")
+        result = fixture.analyze(base, head)
+        self.assertEqual(result.finding, check.FINDING_MISSING_MARKER, result.messages)
+        self.assertIn("dep_marker::Marker", result.messages[0])
+
+    def test_optional_bump_that_changes_a_transitive_crate(self):
+        fixture = Fixture()
+        base = fixture.git("rev-parse", "HEAD")
+        fixture.dep_b_uses_dep_c_2 = True
+        head = fixture.bump("dep_b", "2.0.0", "build(deps): bump dep_b")
+        result = fixture.analyze(base, head)
+        self.assertEqual(result.finding, check.FINDING_MISSING_MARKER, result.messages)
+        self.assertIn("dep_c::Thing", result.messages[0])
+
+    def test_bump_whose_exposed_package_stays_compatible(self):
+        fixture = Fixture()
+        base = fixture.git("rev-parse", "HEAD")
+        head = fixture.bump("dep_b", "2.0.0", "build(deps): bump dep_b")
+        result = fixture.analyze(base, head)
+        self.assertEqual(result.finding, check.FINDING_NONE, result.messages)
+
+    def test_bump_that_moves_a_reexport_to_the_version_used_directly(self):
+        fixture = Fixture(private_dep_c="2.0.0")
+        base = fixture.git("rev-parse", "HEAD")
+        fixture.dep_b_uses_dep_c_2 = True
+        head = fixture.bump("dep_b", "2.0.0", "build(deps): bump dep_b")
+        result = fixture.analyze(base, head)
+        self.assertEqual(result.finding, check.FINDING_MISSING_MARKER, result.messages)
+
+    def test_bump_hidden_by_another_public_use_of_the_new_version(self):
+        for keep in [False, True]:
+            fixture = Fixture(private_dep_c="2.0.0", public_dep_c=True, keep_dep_c_1=keep)
             base = fixture.git("rev-parse", "HEAD")
-            head = fixture.bump(name, "2.0.0", f"build(deps): bump {name}")
+            fixture.dep_b_uses_dep_c_2 = True
+            head = fixture.bump("dep_b", "2.0.0", "build(deps): bump dep_b")
             result = fixture.analyze(base, head)
-            self.assertEqual(result.finding, check.FINDING_MISSING_MARKER, (name, result.messages))
+            self.assertEqual(result.finding, check.FINDING_MISSING_MARKER, (keep, result.messages))
+            self.assertIn("transitive", result.messages[0])
+
+    def test_same_named_impls_in_different_modules(self):
+        fixture = Fixture(
+            private_dep_c="2.0.0", public_dep_c=True, keep_dep_c_1=True, same_named_impls=True
+        )
+        base = fixture.git("rev-parse", "HEAD")
+        fixture.dep_b_uses_dep_c_2 = True
+        head = fixture.bump("dep_b", "2.0.0", "build(deps): bump dep_b")
+        result = fixture.analyze(base, head)
+        self.assertEqual(result.finding, check.FINDING_MISSING_MARKER, result.messages)
+        self.assertIn("impl subject::first::S::get", result.messages[0])
+        self.assertNotIn("second", result.messages[0])
+
+    def test_unmapped_artifact_is_undecided(self):
+        fixture = Fixture()
+        base = fixture.git("rev-parse", "HEAD")
+        head = fixture.bump("dep_sig", "2.0.0", "build(deps): bump dep_sig")
+        original = check.rustdoc_json
+        check.rustdoc_json = lambda *args: (original(*args)[0], {})
+        try:
+            result = fixture.analyze(base, head)
+        finally:
+            check.rustdoc_json = original
+        self.assertEqual(result.finding, check.FINDING_UNDECIDED, result.messages)
 
     def test_bumps_that_are_not_breaking(self):
         cases = [("dep_private", "2.0.0"), ("dep_dev", "2.0.0"), ("dep_sig", "1.1.0")]
@@ -315,7 +488,7 @@ class AnalyzeTest(unittest.TestCase):
         self.assertEqual(result.finding, check.FINDING_NONE, result.messages)
 
     def test_bump_that_changes_a_crate_also_used_in_another_version(self):
-        fixture = Fixture(private_dep_c=True)
+        fixture = Fixture(private_dep_c="1.0.0")
         base = fixture.git("rev-parse", "HEAD")
         fixture.dep_b_uses_dep_c_2 = True
         head = fixture.bump("dep_b", "2.0.0", "build(deps): bump dep_b")
