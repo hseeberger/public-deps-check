@@ -1,0 +1,57 @@
+name: public-deps-check
+description: Require a `!` for semver-incompatible bumps of dependencies in a Rust crate's public API
+
+inputs:
+  command:
+    description: "`analyze` (needs base-sha and toolchain) or `mark` (needs pr-number and token)"
+    required: true
+  head-sha:
+    description: Head commit of the pull request
+    required: true
+  base-sha:
+    description: Base commit of the pull request
+    required: false
+  toolchain:
+    description: Nightly toolchain used for rustdoc JSON
+    required: false
+  pr-number:
+    description: Number of the pull request
+    required: false
+  token:
+    description: Token allowed to create commits and push to the pull request branch
+    required: false
+
+outputs:
+  finding:
+    description: "`none`, `missing-marker`, `workspace-true`, `undecided` or `error`"
+    value: ${{ steps.run.outputs.finding }}
+  head-sha:
+    description: The analyzed head commit
+    value: ${{ steps.run.outputs.head-sha }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        BASE_SHA: ${{ inputs.base-sha }}
+        TOOLCHAIN: ${{ inputs.toolchain }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        script="$GITHUB_ACTION_PATH/public_deps_check.py"
+        case "$COMMAND" in
+          analyze)
+            python3 "$script" analyze --base "$BASE_SHA" --head "$HEAD_SHA" --toolchain "$TOOLCHAIN"
+            ;;
+          mark)
+            python3 "$script" mark --repository "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" --head "$HEAD_SHA"
+            ;;
+          *)
+            echo "unknown command: $COMMAND"
+            exit 1
+            ;;
+        esac
