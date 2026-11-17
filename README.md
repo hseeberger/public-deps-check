@@ -12,6 +12,8 @@ such a bump as breaking, so release-plz would otherwise propose a patch release.
 1. `cargo metadata --no-deps` on both commits gives the requirements of normal dependencies of
    every published package. A change is incompatible when the leftmost nonzero version part
    changes. A changed requirement that is not a plain caret requirement fails as `undecided`.
+   Dependencies on other members of the workspace are ignored, because release-plz updates
+   their requirements itself.
 2. For each package with an incompatible bump, `cargo rustdoc` with JSON output on the given
    nightly runs on both commits. It lists the foreign items in the public API: signatures,
    fields, re-exports, bounds and trait impls, derived ones included. Each item is mapped to

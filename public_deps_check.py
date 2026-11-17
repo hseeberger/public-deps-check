@@ -317,6 +317,7 @@ class Snapshot:
 
 def incompatible_bumps(old_metadata: dict, new_metadata: dict) -> list[Bump]:
     old_packages = {p["name"]: p for p in workspace_packages(old_metadata)}
+    members = old_packages.keys() | {p["name"] for p in workspace_packages(new_metadata)}
     bumps = []
     for package in workspace_packages(new_metadata):
         if not is_published(package) or package["name"] not in old_packages:
@@ -325,7 +326,7 @@ def incompatible_bumps(old_metadata: dict, new_metadata: dict) -> list[Bump]:
         new_reqs = normal_requirements(package)
         for dependency, new_req in new_reqs.items():
             old_req = old_reqs.get(dependency)
-            if old_req is None or old_req == new_req:
+            if dependency in members or old_req is None or old_req == new_req:
                 continue
             if compatibility_key(old_req) != compatibility_key(new_req):
                 bumps.append(Bump(package["name"], dependency, old_req, new_req))
