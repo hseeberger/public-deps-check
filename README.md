@@ -13,19 +13,25 @@ such a bump as breaking, so release-plz would otherwise propose a patch release.
    every published package. A change is incompatible when the leftmost nonzero version part
    changes. A changed requirement that is not a plain caret requirement fails as `undecided`.
 2. For each package with an incompatible bump, `cargo rustdoc` with JSON output on the given
-   nightly lists the foreign items in the public API: signatures, fields, re-exports, bounds and
-   trait impls, derived ones included.
-3. A foreign crate is attributed to the direct dependency that is that crate, or else to the
-   direct dependencies closest to it in the resolve graph of `cargo metadata --all-features`.
+   nightly runs on both commits. It lists the foreign items in the public API: signatures,
+   fields, re-exports, bounds and trait impls, derived ones included. Each item is mapped to
+   the exact package version that defines it, through the crate file rustdoc records and the
+   build artifacts Cargo reports. A crate that cannot be mapped fails as `undecided`.
+3. References are matched across both commits by the local item that holds them, their
+   position in that item, and the path and kind of the foreign item. The bump is breaking when
+   a reference that is public in both now comes from an incompatible version of its package.
+   The finding names the bumped direct dependencies that lead to that package.
 
 The check fails with
 
-- `missing-marker` when an exposed dependency got an incompatible bump and the head commit
-  subject has no `!` (and no `BREAKING CHANGE:` footer);
-- `workspace-true` when such a dependency is declared with `workspace = true`, because
+- `missing-marker` when such a reference exists and the head commit subject has no `!` (and no
+  `BREAKING CHANGE:` footer);
+- `workspace-true` when the bumped dependency is declared with `workspace = true`, because
   release-plz only sees commits that touch the crate's own directory.
 
-A dependency can be excluded in the crate's `Cargo.toml`:
+`exposed` lists, per published crate, the direct dependencies whose crates appear in the public
+API, attributed through the resolve graph. A dependency can be excluded from that list in the
+crate's `Cargo.toml`:
 
 ```toml
 [package.metadata.public-deps]

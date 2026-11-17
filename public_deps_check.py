@@ -169,41 +169,150 @@ def analyze(repo: str, base: str, head: str, toolchain: str, target: str) -> Res
         if not bumps:
             return Result(FINDING_NONE, head, ["no incompatible dependency bump"])
 
-        full_metadata = cargo_metadata(new_dir, no_deps=False)
-        graph = DependencyGraph(full_metadata)
-        packages = {p["name"]: p for p in published_libraries(full_metadata)}
-        marked = has_marker(git(repo, "log", "-1", "--format=%B", head))
-        exposures_by_package = {}
-        missing_marker = []
-        workspace_true = []
-        for bump in bumps:
-            package = packages.get(bump.package)
-            if package is None:
-                continue
-            if bump.package not in exposures_by_package:
-                exposures_by_package[bump.package] = exposed_dependencies(
-                    new_dir, package, graph, toolchain, target
-                )
-            exposure = exposures_by_package[bump.package].get(bump.dependency)
-            if exposure is None:
-                continue
-            evidence = (
-                f"{bump.package}: {bump.dependency} {bump.old} -> {bump.new} is breaking, "
-                f"it appears in the public API ({', '.join(exposure.items[:3])})"
-            )
-            if is_workspace_dependency(package, bump.dependency):
-                workspace_true.append(
-                    f"{evidence}; declare it in {bump.package}'s own Cargo.toml, "
-                    "not with workspace = true"
-                )
-            elif not marked:
-                missing_marker.append(f"{evidence}; the commit subject needs a `!`")
+        try:
+            messages = breaking_changes(repo, head, old_dir, new_dir, bumps, toolchain, target)
+        except Undecided as undecided:
+            return Result(FINDING_UNDECIDED, head, [f"cannot decide: {undecided}"])
 
+    workspace_true = [m for kind, m in messages if kind == FINDING_WORKSPACE_TRUE]
+    missing_marker = [m for kind, m in messages if kind == FINDING_MISSING_MARKER]
     if workspace_true:
         return Result(FINDING_WORKSPACE_TRUE, head, workspace_true + missing_marker)
     if missing_marker:
         return Result(FINDING_MISSING_MARKER, head, missing_marker)
-    return Result(FINDING_NONE, head, ["breaking bumps are marked" if marked else "no public bump"])
+    if messages:
+        return Result(FINDING_NONE, head, ["breaking bumps are marked"])
+    return Result(FINDING_NONE, head, ["no public API item changed to an incompatible version"])
+
+
+def breaking_changes(
+    repo: str,
+    head: str,
+    old_dir: str,
+    new_dir: str,
+    bumps: list[Bump],
+    toolchain: str,
+    target: str,
+) -> list[tuple[str, str]]:
+    """Return the findings, each a kind and a message, for packages with incompatible bumps."""
+    old = Snapshot(old_dir, toolchain, target)
+    new = Snapshot(new_dir, toolchain, target)
+    marked = has_marker(git(repo, "log", "-1", "--format=%B", head))
+    findings = []
+    for name in sorted({bump.package for bump in bumps}):
+        if name not in old.libraries or name not in new.libraries:
+            continue
+        package_bumps = [bump for bump in bumps if bump.package == name]
+        old_items = old.api_items(name)
+        new_items = new.api_items(name)
+        changes = {}
+        for path, dependency, old_versions, new_versions in changed_items(old_items, new_items):
+            change = changes.setdefault(dependency, (set(), set(), []))
+            change[0].update(old_versions)
+            change[1].update(new_versions)
+            change[2].append(path)
+        for dependency, (old_versions, new_versions, paths) in sorted(changes.items()):
+            culprits = [
+                bump
+                for bump in package_bumps
+                if dependency in old.reachable_names(name, bump.dependency)
+                or dependency in new.reachable_names(name, bump.dependency)
+            ]
+            cause = ", ".join(f"{b.dependency} {b.old} -> {b.new}" for b in culprits)
+            shown = ", ".join(f"`{p}`" for p in paths[:3])
+            more = f" and {len(paths) - 3} more" if len(paths) > 3 else ""
+            evidence = (
+                f"{name}: {shown}{more} in the public API now come from {dependency} "
+                f"{'/'.join(sorted(new_versions))} instead of {'/'.join(sorted(old_versions))}"
+                f" (bump: {cause or 'unknown'})"
+            )
+            workspace = [
+                b.dependency
+                for b in culprits
+                if is_workspace_dependency(new.libraries[name], b.dependency)
+            ]
+            if workspace:
+                findings.append(
+                    (
+                        FINDING_WORKSPACE_TRUE,
+                        f"{evidence}; declare {', '.join(workspace)} in {name}'s own "
+                        "Cargo.toml, not with workspace = true",
+                    )
+                )
+            elif marked:
+                findings.append((FINDING_NONE, evidence))
+            else:
+                findings.append(
+                    (FINDING_MISSING_MARKER, f"{evidence}; the commit subject needs a `!`")
+                )
+    return findings
+
+
+def changed_items(
+    old_items: dict[tuple[str, str, str, str], set[tuple[str, str]]],
+    new_items: dict[tuple[str, str, str, str], set[tuple[str, str]]],
+) -> list[tuple[str, str, set[str], set[str]]]:
+    """Return the references public in both snapshots whose defining package changed incompatibly.
+
+    A reference is identified by the local item using it, its position in that item, and the
+    canonical path and kind of the foreign item; each maps to its defining packages as
+    (name, version).
+    """
+    changes = []
+    for identity in sorted(old_items.keys() & new_items.keys()):
+        site, _, path, _ = identity
+        names = {name for name, _ in old_items[identity] | new_items[identity]}
+        for dependency in sorted(names):
+            old_versions = {v for n, v in old_items[identity] if n == dependency}
+            new_versions = {v for n, v in new_items[identity] if n == dependency}
+            old_keys = {compatibility_key(v) for v in old_versions}
+            new_keys = {compatibility_key(v) for v in new_versions}
+            if old_versions and new_versions and old_keys != new_keys:
+                changes.append((f"{path}` in `{site}", dependency, old_versions, new_versions))
+    return changes
+
+
+class Snapshot:
+    """A checked-out commit with its resolve graph and the public API items of its crates."""
+
+    def __init__(self, directory: str, toolchain: str, target: str):
+        self.directory = directory
+        self.toolchain = toolchain
+        self.target = target
+        self.metadata = cargo_metadata(directory, no_deps=False)
+        self.graph = DependencyGraph(self.metadata)
+        self.libraries = {p["name"]: p for p in published_libraries(self.metadata)}
+
+    def api_items(self, name: str) -> dict[tuple[str, str, str, str], set[tuple[str, str]]]:
+        """Return the foreign items in a crate's public API with their defining packages."""
+        package = self.libraries[name]
+        doc, artifacts = rustdoc_json(self.directory, package, self.toolchain, self.target)
+        sysroot = rustc_sysroot(self.toolchain)
+        items = {}
+        for crate_id, references in foreign_reference_sites(doc).items():
+            crate = doc["external_crates"].get(str(crate_id))
+            if crate is None:
+                raise Undecided(f"{name}: rustdoc refers to unknown crate id {crate_id}")
+            if crate["name"] in STD_CRATES:
+                continue
+            path = crate.get("path")
+            if path and os.path.realpath(path).startswith(sysroot):
+                continue
+            package_id = artifacts.get(os.path.realpath(path)) if path else None
+            if package_id is None:
+                raise Undecided(f"{name}: cannot map crate {crate['name']} ({path}) to a package")
+            defining = self.graph.packages[package_id]
+            for identity in references:
+                items.setdefault(identity, set()).add((defining["name"], defining["version"]))
+        return items
+
+    def reachable_names(self, name: str, dependency: str) -> set[str]:
+        """Return the package names reachable from a direct dependency of a crate."""
+        names = set()
+        for package_id in self.graph.direct_dependencies(self.libraries[name]["id"]):
+            if self.graph.packages[package_id]["name"] == dependency:
+                names.update(self.graph.packages[p]["name"] for p in self.graph.distances(package_id))
+        return names
 
 
 def incompatible_bumps(old_metadata: dict, new_metadata: dict) -> list[Bump]:
@@ -293,7 +402,7 @@ def exposed_dependencies(
     rustdoc names crates, not packages, so every package with a matching library name is
     considered; with several versions of a crate in the graph, all of their owners count.
     """
-    crate_items = foreign_api_items(rustdoc_json(directory, package, toolchain, target))
+    crate_items = foreign_api_items(rustdoc_json(directory, package, toolchain, target)[0])
     direct = graph.direct_dependencies(package["id"])
     distances = {dependency: graph.distances(dependency) for dependency in direct}
     closure = set().union(*distances.values()) if distances else set()
@@ -325,9 +434,20 @@ def exposed_dependencies(
 def foreign_api_items(doc: dict) -> dict[str, set[str]]:
     """Return the foreign items the public API refers to, grouped by crate name."""
     crates = {int(id): crate["name"] for id, crate in doc["external_crates"].items()}
+    items = {}
+    for crate_id, references in foreign_references(doc).items():
+        crate = crates.get(crate_id)
+        if crate is None or crate in STD_CRATES:
+            continue
+        items.setdefault(crate, set()).update(path for path, _ in references)
+    return items
+
+
+def foreign_references(doc: dict) -> dict[int, set[tuple[str, str]]]:
+    """Return the foreign items the public API refers to as (path, kind), by crate id."""
     paths = doc["paths"]
     index = doc["index"]
-    items = {}
+    references = {}
     for item in index.values():
         if item["crate_id"] != 0:
             continue
@@ -338,19 +458,184 @@ def foreign_api_items(doc: dict) -> dict[str, set[str]]:
             summary = paths.get(str(referenced))
             if summary is not None:
                 crate_id = summary["crate_id"]
-                name = "::".join(summary["path"])
+                identity = ("::".join(summary["path"]), summary["kind"])
             elif str(referenced) in index:
-                crate_id = index[str(referenced)]["crate_id"]
-                name = index[str(referenced)].get("name") or str(referenced)
+                foreign = index[str(referenced)]
+                crate_id = foreign["crate_id"]
+                identity = (foreign.get("name") or "", next(iter(foreign["inner"]), ""))
             else:
                 continue
-            if crate_id == 0:
+            if crate_id != 0:
+                references.setdefault(crate_id, set()).add(identity)
+    return references
+
+
+def foreign_reference_sites(doc: dict) -> dict[int, set[tuple[str, str, str, str]]]:
+    """Return the foreign references of the public API as (site, position, path, kind), by crate id.
+
+    The site names the local item holding the reference and the position is the JSON path of the
+    reference within that item, so both are stable across snapshots of the same API.
+    """
+    paths = doc["paths"]
+    index = doc["index"]
+    sites = local_sites(doc)
+    holders = {}
+    references = {}
+    for id, item in index.items():
+        if item["crate_id"] != 0:
+            continue
+        inner = item["inner"]
+        if "impl" in inner and (inner["impl"].get("blanket_impl") or inner["impl"].get("is_synthetic")):
+            continue
+        for position, referenced in referenced_positions(inner):
+            summary = paths.get(str(referenced))
+            if summary is not None:
+                crate_id = summary["crate_id"]
+                path, kind = "::".join(summary["path"]), summary["kind"]
+            elif str(referenced) in index:
+                foreign = index[str(referenced)]
+                crate_id = foreign["crate_id"]
+                path, kind = foreign.get("name") or "", next(iter(foreign["inner"]), "")
+            else:
                 continue
-            crate = crates.get(crate_id)
-            if crate is None or crate in STD_CRATES:
-                continue
-            items.setdefault(crate, set()).add(name)
-    return items
+            if crate_id != 0:
+                key = (sites[id], position, path, kind)
+                if holders.setdefault(key, crate_id) != crate_id:
+                    raise Undecided(
+                        f"items of the public API named `{sites[id]}` refer to `{path}` "
+                        "from different crates"
+                    )
+                references.setdefault(crate_id, set()).add(key)
+    return references
+
+
+def local_sites(doc: dict) -> dict[str, str]:
+    """Return a name for every local item that is stable across snapshots of the same API."""
+    index = doc["index"]
+    paths = doc["paths"]
+    parents = {}
+    for id, item in index.items():
+        if item["crate_id"] == 0:
+            for child in child_ids(item["inner"]):
+                parents.setdefault(str(child), id)
+    sites = {}
+
+    def site(id: str) -> str:
+        if id in sites:
+            return sites[id]
+        item = index[id]
+        inner = item["inner"]
+        summary = paths.get(id)
+        if "impl" in inner:
+            impl = inner["impl"]
+            implemented = type_text(impl.get("for"), paths)
+            trait = impl.get("trait")
+            name = f"impl {type_text(trait, paths)} for {implemented}" if trait else f"impl {implemented}"
+        elif summary is not None and summary["crate_id"] == 0:
+            name = "::".join(summary["path"])
+        else:
+            parent = parents.get(id)
+            prefix = site(parent) if parent is not None else "?"
+            name = f"{prefix}::{item.get('name') or next(iter(inner), '')}"
+        sites[id] = name
+        return name
+
+    for id, item in index.items():
+        if item["crate_id"] == 0:
+            site(id)
+    return sites
+
+
+def child_ids(inner: dict) -> list[int]:
+    """Return the ids of the items an item contains: module and impl items, fields, variants."""
+    children = []
+    stack = [inner]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if key in ("items", "fields", "variants", "tuple") and isinstance(value, list):
+                    children.extend(v for v in value if isinstance(v, int))
+                if key != "impls" and isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(current, list):
+            stack.extend(v for v in current if isinstance(v, (dict, list)))
+    return children
+
+
+def type_text(value, paths: dict) -> str:
+    """Return a type or path from rustdoc JSON as Rust-like text with canonical item paths.
+
+    Paths are resolved through their item ids, so equally named types of different modules or
+    crates differ; anything unknown falls back to JSON.
+    """
+    if value is None:
+        return "_"
+    if isinstance(value, dict) and "path" in value and "args" in value:
+        summary = paths.get(str(value.get("id")))
+        name = "::".join(summary["path"]) if summary is not None else f"?{value['path']}"
+        return name + args_text(value["args"], paths)
+    if isinstance(value, dict) and len(value) == 1:
+        kind, inner = next(iter(value.items()))
+        if kind == "resolved_path":
+            return type_text(inner, paths)
+        if kind in ("generic", "primitive") and isinstance(inner, str):
+            return inner
+        if kind == "borrowed_ref":
+            return "&" + ("mut " if inner.get("is_mutable") else "") + type_text(inner.get("type"), paths)
+        if kind == "tuple":
+            return "(" + ", ".join(type_text(t, paths) for t in inner) + ")"
+        if kind == "slice":
+            return "[" + type_text(inner, paths) + "]"
+        if kind == "array":
+            return f"[{type_text(inner.get('type'), paths)}; {inner.get('len')}]"
+    return json.dumps(without_ids(value), sort_keys=True, separators=(",", ":"))
+
+
+def args_text(args, paths: dict) -> str:
+    if not args:
+        return ""
+    if "angle_bracketed" in args:
+        parts = []
+        for arg in args["angle_bracketed"].get("args", []):
+            if "type" in arg:
+                parts.append(type_text(arg["type"], paths))
+            elif "lifetime" in arg:
+                parts.append(arg["lifetime"])
+            else:
+                parts.append(json.dumps(without_ids(arg), sort_keys=True, separators=(",", ":")))
+        constraints = args["angle_bracketed"].get("constraints", [])
+        if constraints:
+            parts.append(json.dumps(without_ids(constraints), sort_keys=True, separators=(",", ":")))
+        return "<" + ", ".join(parts) + ">" if parts else ""
+    return json.dumps(without_ids(args), sort_keys=True, separators=(",", ":"))
+
+
+def without_ids(value):
+    if isinstance(value, dict):
+        return {k: without_ids(v) for k, v in value.items() if k != "id"}
+    if isinstance(value, list):
+        return [without_ids(v) for v in value]
+    return value
+
+
+def referenced_positions(value) -> set[tuple[str, int]]:
+    """Return every item id a JSON value refers to through an `id` field, with its JSON path."""
+    found = set()
+    stack = [(value, "")]
+    while stack:
+        current, position = stack.pop()
+        if isinstance(current, dict):
+            for key, child in current.items():
+                if key == "id" and isinstance(child, int):
+                    found.add((position, child))
+                elif isinstance(child, (dict, list)):
+                    stack.append((child, f"{position}/{key}"))
+        elif isinstance(current, list):
+            for i, child in enumerate(current):
+                if isinstance(child, (dict, list)):
+                    stack.append((child, f"{position}/{i}"))
+    return found
 
 
 def referenced_ids(value) -> set[int]:
@@ -370,13 +655,18 @@ def referenced_ids(value) -> set[int]:
     return ids
 
 
-def rustdoc_json(directory: str, package: dict, toolchain: str, target: str) -> dict:
-    subprocess.run(
+def rustdoc_json(
+    directory: str, package: dict, toolchain: str, target: str
+) -> tuple[dict, dict[str, str]]:
+    """Return the rustdoc JSON of a crate and the build artifacts, from real file path to package id."""
+    build = subprocess.run(
         [
             "cargo",
             f"+{toolchain}",
             "rustdoc",
             "--quiet",
+            "--message-format",
+            "json",
             "--manifest-path",
             os.path.join(directory, "Cargo.toml"),
             "--package",
@@ -392,9 +682,24 @@ def rustdoc_json(directory: str, package: dict, toolchain: str, target: str) -> 
         ],
         check=True,
         cwd=directory,
+        stdout=subprocess.PIPE,
+        text=True,
     )
+    artifacts = {}
+    for line in build.stdout.splitlines():
+        message = json.loads(line)
+        if message.get("reason") == "compiler-artifact":
+            for filename in message["filenames"]:
+                artifacts[os.path.realpath(filename)] = message["package_id"]
     with open(os.path.join(target, "doc", f"{library_name(package)}.json")) as file:
-        return json.load(file)
+        return json.load(file), artifacts
+
+
+def rustc_sysroot(toolchain: str) -> str:
+    output = subprocess.run(
+        ["rustc", f"+{toolchain}", "--print", "sysroot"], check=True, capture_output=True, text=True
+    ).stdout
+    return os.path.realpath(output.strip())
 
 
 def is_workspace_dependency(package: dict, dependency: str) -> bool:
