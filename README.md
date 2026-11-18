@@ -84,7 +84,7 @@ public-deps-mark:
     - id: app-token
       uses: actions/create-github-app-token@<sha>
       with:
-        app-id: ${{ secrets.APP_ID }}
+        client-id: ${{ secrets.APP_CLIENT_ID }}
         private-key: ${{ secrets.APP_PRIVATE_KEY }}
     - uses: hseeberger/public-deps-check@<sha>
       with:
@@ -96,7 +96,7 @@ public-deps-mark:
 
 The `public-deps` job builds the pull request's dependencies, whose build scripts run arbitrary
 code, so it gets no secrets. `public-deps-mark` never checks out or builds the pull request.
-For Dependabot pull requests, `APP_ID` and `APP_PRIVATE_KEY` must be Dependabot secrets.
+For Dependabot pull requests, `APP_CLIENT_ID` and `APP_PRIVATE_KEY` must be Dependabot secrets.
 
 Locally:
 
