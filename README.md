@@ -105,6 +105,14 @@ python3 public_deps_check.py analyze --base origin/main --head HEAD --toolchain 
 python3 public_deps_check.py exposed --toolchain nightly-2026-11-09
 ```
 
+## Releases
+
+A release is a signed tag `vX.Y.Z` on `main`. `git cliff --bumped-version` proposes the version:
+in 0.x, a breaking change bumps the minor version and anything else the patch version. Pushing
+the tag runs the release workflow, which creates the GitHub release with notes from git-cliff.
+Repositories pin the action as `hseeberger/public-deps-check@<sha> # vX.Y.Z`, so Dependabot can
+update the pin.
+
 ## License
 
 Apache-2.0
