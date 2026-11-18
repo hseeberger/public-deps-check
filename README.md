@@ -1,5 +1,8 @@
 # public-deps-check
 
+**Archived.** The successor is [breaking-bump](https://github.com/hseeberger/breaking-bump), a
+Cargo subcommand with a reusable workflow.
+
 A GitHub Action that requires a conventional-commit `!` when a pull request bumps a dependency
 that appears in a published crate's public API to a semver-incompatible version, for example
 utoipa 5.5 to 6.0 or async-nats 0.50 to 0.51. Neither cargo-semver-checks nor Dependabot flag
