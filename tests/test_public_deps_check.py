@@ -232,7 +232,7 @@ class Fixture:
         if self.workspace:
             self.write(
                 "Cargo.toml",
-                '[workspace]\nmembers = ["subject"]\nresolver = "3"\n\n'
+                '[workspace]\nmembers = ["subject"]\nexclude = ["deps"]\nresolver = "3"\n\n'
                 "[workspace.dependencies]\n"
                 f'dep_sig = {{ path = "deps/dep_sig", version = "{self.versions["dep_sig"]}" }}\n',
             )
@@ -272,6 +272,29 @@ class CompatibilityTest(unittest.TestCase):
         for requirement in ["~1.2", "=1.2.3", ">=1, <3", "*"]:
             with self.assertRaises(check.Undecided):
                 check.compatibility_key(requirement)
+
+
+class IncompatibleBumpsTest(unittest.TestCase):
+    def test_ignores_workspace_members(self):
+        def metadata(core: str, external: str) -> dict:
+            def package(name: str, dependencies: list[dict]) -> dict:
+                return {"id": name, "name": name, "publish": None, "dependencies": dependencies}
+
+            def dependency(name: str, req: str) -> dict:
+                return {"name": name, "req": req, "kind": None}
+
+            return {
+                "workspace_members": ["core", "plugin"],
+                "packages": [
+                    package("core", []),
+                    package("plugin", [dependency("core", core), dependency("ext", external)]),
+                ],
+            }
+
+        bumps = check.incompatible_bumps(
+            metadata("^0.27.1", "^1.0"), metadata("^0.28.0", "^2.0")
+        )
+        self.assertEqual([(b.package, b.dependency) for b in bumps], [("plugin", "ext")])
 
 
 class ChangedItemsTest(unittest.TestCase):
